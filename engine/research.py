@@ -1,16 +1,11 @@
 """
-Deterministic research scoring for normalized BRAIN alpha results.
+Deterministic IS-first research scoring for normalized BRAIN alpha results.
 
-This module sits ABOVE results.py eligibility logic.
-
-Eligibility answers:
-    "Does this alpha currently satisfy the submission gates?"
-
-Research scoring answers:
-    "How useful is this result for deciding what to try next?"
-
-A rejected alpha can therefore still be PROMISING when its out-of-sample
-performance is strong but a structural/robustness gate prevents submission.
+Research scoring is deliberately separate from BRAIN eligibility.  The
+primary objective is to identify alphas that have credible, robust
+In-Sample performance.  The BRAIN Test Period is treated as an IS stability
+check, not as true OOS.  True OOS is unavailable until an Alpha is submitted
+for OOS testing.
 """
 
 from __future__ import annotations
@@ -19,47 +14,57 @@ from dataclasses import dataclass, field
 from math import isfinite
 from typing import Iterable, Sequence, Any
 
-
 PROMISING = "PROMISING"
 WEAK = "WEAK"
 FAILURE = "FAILURE"
 
+# ------------------------- scoring weights -------------------------
+IS_PERFORMANCE_MAX = 35.0
+IS_ROBUSTNESS_MAX = 30.0
+IS_STABILITY_MAX = 15.0
+TURNOVER_MAX = 10.0
+TEST_PERIOD_MAX = 10.0
+TOTAL_MAX = 100.0
 
-# ---------------------------------------------------------------------------
-# Scoring configuration
-# ---------------------------------------------------------------------------
-
-TEST_SHARPE_STRONG = 1.50
-TEST_SHARPE_EXCELLENT = 2.50
-TEST_FITNESS_STRONG = 1.00
-TEST_FITNESS_EXCELLENT = 2.50
-
-TEST_SHARPE_FAILURE = -1.00
-TEST_FITNESS_FAILURE = -1.00
-
-TRAIN_TEST_SHARPE_GAP_WARNING = 2.00
-TRAIN_TEST_FITNESS_GAP_WARNING = 3.00
-
+# BRAIN/consultant-style practical reference points.  These are scoring
+# anchors, not substitutes for BRAIN's own eligibility rules.
+TRAIN_SHARPE_GOOD = 1.25
+TRAIN_SHARPE_EXCELLENT = 2.00
+TRAIN_FITNESS_GOOD = 1.00
+TRAIN_FITNESS_EXCELLENT = 2.00
+TEST_SHARPE_GOOD = 1.25
+TEST_FITNESS_GOOD = 1.00
+TRAIN_SHARPE_HARD_FAIL = 0.0
+TRAIN_FITNESS_HARD_FAIL = 0.0
 MIN_TURNOVER = 0.01
 MAX_TURNOVER = 0.70
 
+# Large train/test-period disagreement is a strong overfitting warning.
+SHARPE_GAP_WARNING = 1.50
+SHARPE_GAP_SEVERE = 2.50
+FITNESS_GAP_WARNING = 2.00
+FITNESS_GAP_SEVERE = 4.00
 
-# ---------------------------------------------------------------------------
-# Public data structures
-# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class ResearchScore:
-    """Deterministic research value assigned to one normalized result."""
-
     alpha_id: str | None
     score: float
     research_class: str
 
+    # Compatibility fields.  test_period_score is now the primary label;
+    # oos_score is retained for older UI/code and mirrors Test Period score.
     oos_score: float
     consistency_score: float
     turnover_score: float
     robustness_score: float
+
+    # New explicit IS-first components.
+    is_performance_score: float = 0.0
+    is_robustness_score: float = 0.0
+    is_stability_score: float = 0.0
+    test_period_score: float = 0.0
+    true_oos_score: float = 0.0
 
     strengths: list[str] = field(default_factory=list)
     weaknesses: list[str] = field(default_factory=list)
@@ -70,362 +75,313 @@ class ResearchScore:
     warning_brain_test_names: list[str] = field(default_factory=list)
 
 
-# ---------------------------------------------------------------------------
-# Small helpers
-# ---------------------------------------------------------------------------
-
 def _safe_float(value: Any) -> float | None:
-    """Convert a value to float, returning None for missing/non-finite data."""
-
     if value is None:
         return None
-
     try:
-        result = float(value)
+        x = float(value)
     except (TypeError, ValueError):
         return None
-
-    if not isfinite(result):
-        return None
-
-    return result
+    return x if isfinite(x) else None
 
 
 def _clamp(value: float, lower: float, upper: float) -> float:
-    """Clamp value into [lower, upper]."""
-
     return max(lower, min(upper, value))
 
 
 def _names(items: Iterable[Any]) -> list[str]:
-    """Extract non-empty names from mappings or objects."""
-
-    output: list[str] = []
-
+    out: list[str] = []
     for item in items:
         if isinstance(item, dict):
             value = item.get("name")
         else:
             value = getattr(item, "name", None)
-
-        if value is not None:
-            text = str(value).strip()
-            if text:
-                output.append(text)
-
-    return output
+        if value is not None and str(value).strip():
+            out.append(str(value).strip())
+    return out
 
 
 def _status_for_gate(gate: Any) -> str:
-    """Read status from a GateResult-like object."""
-
     if isinstance(gate, dict):
         return str(gate.get("status", "")).upper()
-
     return str(getattr(gate, "status", "")).upper()
 
 
 def _name_for_gate(gate: Any) -> str:
-    """Read name from a GateResult-like object."""
-
     if isinstance(gate, dict):
         return str(gate.get("name", ""))
-
     return str(getattr(gate, "name", ""))
 
 
 def _brain_test_names(result: Any, attribute: str) -> list[str]:
-    """Extract BRAIN test names from a normalized result."""
-
     return _names(getattr(result, attribute, []) or [])
 
 
-# ---------------------------------------------------------------------------
-# Component scoring
-# ---------------------------------------------------------------------------
+def _raw_branch(result: Any, branch: str, subbranch: str | None = None) -> dict[str, Any]:
+    raw = getattr(result, "raw_record", None)
+    if not isinstance(raw, dict):
+        return {}
+    node = raw.get(branch)
+    if subbranch is not None and isinstance(node, dict):
+        node = node.get(subbranch)
+    return node if isinstance(node, dict) else {}
 
-def _score_oos(metrics: Any) -> tuple[float, list[str], list[str], list[str]]:
-    """Score out-of-sample performance on a 0-40 scale."""
 
-    test_sharpe = _safe_float(getattr(metrics, "test_sharpe", None))
-    test_fitness = _safe_float(getattr(metrics, "test_fitness", None))
+def _metric_value(data: dict[str, Any], key: str) -> float | None:
+    return _safe_float(data.get(key))
 
+
+def _score_train_performance(metrics: Any) -> tuple[float, list[str], list[str], list[str]]:
+    """Score the main In-Sample train performance on 35 points."""
+    sharpe = _safe_float(getattr(metrics, "train_sharpe", None))
+    fitness = _safe_float(getattr(metrics, "train_fitness", None))
+    returns = _safe_float(getattr(metrics, "train_returns", None))
+    drawdown = _safe_float(getattr(metrics, "train_drawdown", None))
+    margin = _safe_float(getattr(metrics, "train_margin", None))
+
+    strengths: list[str] = []
+    weaknesses: list[str] = []
+    reasons: list[str] = []
     score = 0.0
+
+    if sharpe is None:
+        weaknesses.append("Train Sharpe unavailable.")
+    else:
+        score += _clamp((sharpe + 0.5) / 2.5 * 20.0, 0.0, 20.0)
+        if sharpe >= TRAIN_SHARPE_EXCELLENT:
+            strengths.append(f"Excellent In-Sample train Sharpe ({sharpe:.2f}).")
+        elif sharpe >= TRAIN_SHARPE_GOOD:
+            strengths.append(f"Good In-Sample train Sharpe ({sharpe:.2f}).")
+        elif sharpe <= TRAIN_SHARPE_HARD_FAIL:
+            weaknesses.append(f"In-Sample train Sharpe is non-positive ({sharpe:.2f}).")
+        else:
+            weaknesses.append(f"In-Sample train Sharpe is weak ({sharpe:.2f}).")
+
+    if fitness is None:
+        weaknesses.append("Train fitness unavailable.")
+    else:
+        score += _clamp((fitness + 0.5) / 2.5 * 10.0, 0.0, 10.0)
+        if fitness >= TRAIN_FITNESS_EXCELLENT:
+            strengths.append(f"Excellent In-Sample train fitness ({fitness:.2f}).")
+        elif fitness >= TRAIN_FITNESS_GOOD:
+            strengths.append(f"Good In-Sample train fitness ({fitness:.2f}).")
+        elif fitness <= TRAIN_FITNESS_HARD_FAIL:
+            weaknesses.append(f"In-Sample train fitness is non-positive ({fitness:.2f}).")
+
+    aux = 0.0
+    if returns is not None and returns > 0:
+        aux += min(2.0, returns * 20.0)
+    if margin is not None and margin > 0:
+        aux += min(1.0, margin * 200.0)
+    if drawdown is not None:
+        if drawdown <= 0.10:
+            aux += 2.0
+        elif drawdown <= 0.20:
+            aux += 1.0
+    score += _clamp(aux, 0.0, 5.0)
+
+    return _clamp(score, 0.0, IS_PERFORMANCE_MAX), strengths, weaknesses, reasons
+
+
+def _score_is_robustness(result: Any) -> tuple[float, list[str], list[str], list[str]]:
+    """Score the complete BRAIN IS robustness evidence on 30 points."""
+    failed = [x.upper() for x in _brain_test_names(result, "failed_brain_tests")]
+    warnings = [x.upper() for x in _brain_test_names(result, "warning_brain_tests")]
+
+    severe = {
+        "LOW_SHARPE", "LOW_FITNESS", "LOW_2Y_SHARPE",
+        "LOW_SUB_UNIVERSE_SHARPE", "LOW_ROBUST_UNIVERSE_SHARPE",
+    }
+    regional = {"LOW_GLB_AMER_SHARPE", "LOW_GLB_EMEA_SHARPE", "LOW_GLB_APAC_SHARPE"}
+    structural = {"CONCENTRATED_WEIGHT", "LOW_TURNOVER", "HIGH_TURNOVER", "REGULAR_SUBMISSION", "POWERPOOL_SUBMISSION"}
+
+    score = 30.0
     strengths: list[str] = []
     weaknesses: list[str] = []
     reasons: list[str] = []
 
-    if test_sharpe is None:
-        weaknesses.append("Test Sharpe unavailable.")
+    severe_count = sum(x in severe for x in failed)
+    regional_count = sum(x in regional for x in failed)
+    structural_count = sum(x in structural for x in failed)
+
+    score -= 4.0 * severe_count
+    score -= 2.0 * regional_count
+    score -= 1.0 * structural_count
+    score -= 0.25 * len(warnings)
+
+    if not failed:
+        strengths.append("No failed BRAIN robustness tests in the returned IS evidence.")
     else:
-        sharpe_points = _clamp(
-            (test_sharpe + 1.0) / 3.5 * 25.0,
-            0.0,
-            25.0,
-        )
-        score += sharpe_points
+        if severe_count:
+            weaknesses.append(f"{severe_count} major BRAIN IS test(s) failed.")
+        if regional_count:
+            weaknesses.append(f"{regional_count} regional IS robustness test(s) failed.")
+        if structural_count:
+            reasons.append("Some failed BRAIN tests are structural/fixable.")
 
-        if test_sharpe >= TEST_SHARPE_EXCELLENT:
-            strengths.append(f"Excellent OOS Sharpe ({test_sharpe:.2f}).")
-        elif test_sharpe >= TEST_SHARPE_STRONG:
-            strengths.append(f"Strong OOS Sharpe ({test_sharpe:.2f}).")
-        elif test_sharpe <= TEST_SHARPE_FAILURE:
-            weaknesses.append(f"Poor OOS Sharpe ({test_sharpe:.2f}).")
-        else:
-            weaknesses.append(f"Limited OOS Sharpe ({test_sharpe:.2f}).")
+    # Complete returned train branches are genuine IS diagnostics.
+    train = _raw_branch(result, "train")
+    rn = train.get("riskNeutralized") if isinstance(train, dict) else None
+    ic = train.get("investabilityConstrained") if isinstance(train, dict) else None
+    base_sharpe = _metric_value(train, "sharpe") if train else None
 
-    if test_fitness is None:
-        weaknesses.append("Test fitness unavailable.")
-    else:
-        fitness_points = _clamp(
-            (test_fitness + 1.0) / 3.5 * 15.0,
-            0.0,
-            15.0,
-        )
-        score += fitness_points
+    if isinstance(rn, dict) and base_sharpe is not None:
+        rn_sharpe = _metric_value(rn, "sharpe")
+        if rn_sharpe is not None:
+            delta = rn_sharpe - base_sharpe
+            if rn_sharpe > 0 and delta >= -0.25:
+                score += 1.5
+                strengths.append(f"Train risk-neutralized Sharpe survives well ({rn_sharpe:.2f}).")
+            elif delta <= -0.75:
+                score -= 1.5
+                weaknesses.append(f"Train risk-neutralized Sharpe drops materially ({rn_sharpe:.2f}).")
 
-        if test_fitness >= TEST_FITNESS_EXCELLENT:
-            strengths.append(f"Excellent OOS fitness ({test_fitness:.2f}).")
-        elif test_fitness >= TEST_FITNESS_STRONG:
-            strengths.append(f"Strong OOS fitness ({test_fitness:.2f}).")
-        elif test_fitness <= TEST_FITNESS_FAILURE:
-            weaknesses.append(f"Poor OOS fitness ({test_fitness:.2f}).")
-        else:
-            weaknesses.append(f"Limited OOS fitness ({test_fitness:.2f}).")
+    if isinstance(ic, dict) and base_sharpe is not None:
+        ic_sharpe = _metric_value(ic, "sharpe")
+        if ic_sharpe is not None:
+            delta = ic_sharpe - base_sharpe
+            if ic_sharpe > 0 and delta >= -0.25:
+                score += 1.5
+                strengths.append(f"Train investability-constrained Sharpe survives well ({ic_sharpe:.2f}).")
+            elif delta <= -0.75:
+                score -= 1.5
+                weaknesses.append(f"Train investability-constrained Sharpe drops materially ({ic_sharpe:.2f}).")
 
-    if (
-        test_sharpe is not None
-        and test_fitness is not None
-        and test_sharpe >= TEST_SHARPE_STRONG
-        and test_fitness >= TEST_FITNESS_STRONG
-    ):
-        reasons.append("Both primary OOS metrics are strong.")
-
-    return score, strengths, weaknesses, reasons
+    return _clamp(score, 0.0, IS_ROBUSTNESS_MAX), strengths, weaknesses, reasons
 
 
-def _score_consistency(metrics: Any) -> tuple[float, list[str], list[str], list[str]]:
-    """Score train/test consistency on a 0-20 scale."""
-
+def _score_is_stability(metrics: Any, result: Any) -> tuple[float, list[str], list[str], list[str]]:
+    """Score train vs BRAIN Test Period stability on 15 points."""
     train_sharpe = _safe_float(getattr(metrics, "train_sharpe", None))
     test_sharpe = _safe_float(getattr(metrics, "test_sharpe", None))
     train_fitness = _safe_float(getattr(metrics, "train_fitness", None))
     test_fitness = _safe_float(getattr(metrics, "test_fitness", None))
 
-    score = 10.0
     strengths: list[str] = []
     weaknesses: list[str] = []
     reasons: list[str] = []
+    score = 7.5
 
-    if train_sharpe is None or test_sharpe is None:
-        score -= 3.0
-        weaknesses.append("Train/test Sharpe comparison unavailable.")
-    else:
+    if train_sharpe is not None and test_sharpe is not None:
         gap = abs(train_sharpe - test_sharpe)
-
-        if gap <= TRAIN_TEST_SHARPE_GAP_WARNING:
-            score += 5.0
-            strengths.append("Train/test Sharpe is reasonably consistent.")
-        else:
-            score -= 5.0
-            weaknesses.append(f"Large train/test Sharpe gap ({gap:.2f}).")
-
         if train_sharpe > 0 and test_sharpe > 0:
-            score += 5.0
-            reasons.append("Train and test Sharpe have the same positive sign.")
+            score += 4.0
+            strengths.append("Train and Test Period Sharpe have the same positive sign.")
         elif train_sharpe <= 0 < test_sharpe:
-            weaknesses.append(
-                "Test Sharpe is positive while train Sharpe is non-positive."
-            )
-        elif train_sharpe > 0 and test_sharpe <= 0:
-            score -= 5.0
-            weaknesses.append("Test Sharpe lost the positive train signal.")
+            score -= 4.0
+            weaknesses.append("Test Period Sharpe is positive while train Sharpe is non-positive.")
+        elif train_sharpe > 0 >= test_sharpe:
+            score -= 4.0
+            weaknesses.append("Test Period Sharpe loses the positive train signal.")
 
-    if train_fitness is None or test_fitness is None:
-        score -= 2.0
-        weaknesses.append("Train/test fitness comparison unavailable.")
-    else:
-        gap = abs(train_fitness - test_fitness)
-
-        if gap <= TRAIN_TEST_FITNESS_GAP_WARNING:
+        if gap <= SHARPE_GAP_WARNING:
             score += 2.5
+        elif gap >= SHARPE_GAP_SEVERE:
+            score -= 4.0
+            weaknesses.append(f"Severe train/Test Period Sharpe gap ({gap:.2f}).")
         else:
-            score -= 2.5
-            weaknesses.append(f"Large train/test fitness gap ({gap:.2f}).")
+            score -= 1.5
+            weaknesses.append(f"Large train/Test Period Sharpe gap ({gap:.2f}).")
+    else:
+        score -= 2.0
+        weaknesses.append("Train/Test Period Sharpe comparison unavailable.")
 
-    return _clamp(score, 0.0, 20.0), strengths, weaknesses, reasons
+    if train_fitness is not None and test_fitness is not None:
+        gap = abs(train_fitness - test_fitness)
+        if gap <= FITNESS_GAP_WARNING:
+            score += 1.0
+        elif gap >= FITNESS_GAP_SEVERE:
+            score -= 2.0
+            weaknesses.append(f"Severe train/Test Period fitness gap ({gap:.2f}).")
+        else:
+            score -= 0.5
+    else:
+        score -= 1.0
+
+    failed = {x.upper() for x in _brain_test_names(result, "failed_brain_tests")}
+    if "LOW_2Y_SHARPE" in failed:
+        score -= 2.0
+        weaknesses.append("BRAIN reports weak 2Y In-Sample Sharpe.")
+    else:
+        reasons.append("No LOW_2Y_SHARPE failure was returned.")
+
+    return _clamp(score, 0.0, IS_STABILITY_MAX), strengths, weaknesses, reasons
 
 
 def _score_turnover(metrics: Any) -> tuple[float, list[str], list[str], list[str]]:
-    """Score turnover suitability on a 0-10 scale."""
-
-    test_turnover = _safe_float(getattr(metrics, "test_turnover", None))
-
-    if test_turnover is None:
-        return 4.0, [], ["Test turnover unavailable."], []
-
-    if MIN_TURNOVER < test_turnover < MAX_TURNOVER:
-        if test_turnover >= 0.02:
-            return (
-                10.0,
-                [f"Turnover is comfortably investable ({test_turnover:.4f})."],
-                [],
-                [],
-            )
-
-        return (
-            8.0,
-            [f"Turnover passes the local gate ({test_turnover:.4f})."],
-            [],
-            [],
-        )
-
-    if test_turnover <= MIN_TURNOVER:
-        return (
-            2.0,
-            [],
-            [f"Turnover is too low ({test_turnover:.4f})."],
-            ["Low turnover is often a structural/fixable issue."],
-        )
-
-    return (
-        4.0,
-        [],
-        [f"Turnover is too high ({test_turnover:.4f})."],
-        ["High turnover may be reduced by smoothing/decay."],
-    )
+    turnover = _safe_float(getattr(metrics, "train_turnover", None))
+    if turnover is None:
+        return 4.0, [], ["Train turnover unavailable."], []
+    if MIN_TURNOVER < turnover < MAX_TURNOVER:
+        if turnover >= 0.02:
+            return 10.0, [f"Train turnover is comfortably investable ({turnover:.4f})."], [], []
+        return 8.0, [f"Train turnover passes the local gate ({turnover:.4f})."], [], []
+    if turnover <= MIN_TURNOVER:
+        return 3.0, [], [f"Train turnover is too low ({turnover:.4f})."], ["Low turnover may signal an overly static signal."]
+    return 2.0, [], [f"Train turnover is too high ({turnover:.4f})."], ["High turnover may be reduced by smoothing/decay."]
 
 
-def _score_robustness(result: Any) -> tuple[float, list[str], list[str], list[str]]:
-    """
-    Score BRAIN robustness on a 0-15 scale.
-
-    Some failures are treated as fixable structural problems; broad negative
-    evidence receives a larger penalty.
-    """
-
-    failed = [
-        name.upper()
-        for name in _brain_test_names(result, "failed_brain_tests")
-    ]
-    warnings = [
-        name.upper()
-        for name in _brain_test_names(result, "warning_brain_tests")
-    ]
-
-    score = 15.0
+def _score_test_period(metrics: Any) -> tuple[float, list[str], list[str], list[str]]:
+    """Score BRAIN Test Period strength on only 10 points."""
+    sharpe = _safe_float(getattr(metrics, "test_sharpe", None))
+    fitness = _safe_float(getattr(metrics, "test_fitness", None))
+    score = 0.0
     strengths: list[str] = []
     weaknesses: list[str] = []
     reasons: list[str] = []
 
-    fixable_tests = {
-        "LOW_TURNOVER",
-        "HIGH_TURNOVER",
-        "CONCENTRATED_WEIGHT",
-        "REGULAR_SUBMISSION",
-        "POWERPOOL_SUBMISSION",
-    }
-
-    severe_tests = {
-        "LOW_SHARPE",
-        "LOW_FITNESS",
-        "LOW_2Y_SHARPE",
-        "LOW_SUB_UNIVERSE_SHARPE",
-        "LOW_ROBUST_UNIVERSE_SHARPE",
-    }
-
-    regional_tests = {
-        "LOW_GLB_AMER_SHARPE",
-        "LOW_GLB_EMEA_SHARPE",
-        "LOW_GLB_APAC_SHARPE",
-    }
-
-    severe_count = sum(name in severe_tests for name in failed)
-    regional_count = sum(name in regional_tests for name in failed)
-    fixable_count = sum(name in fixable_tests for name in failed)
-
-    score -= 2.5 * severe_count
-    score -= 1.5 * regional_count
-    score -= 0.75 * fixable_count
-    score -= 0.25 * len(warnings)
-
-    if not failed:
-        strengths.append("No failed BRAIN tests.")
+    if sharpe is not None:
+        score += _clamp((sharpe + 0.5) / 2.5 * 6.0, 0.0, 6.0)
+        if sharpe >= 2.0:
+            strengths.append(f"Strong Test Period Sharpe ({sharpe:.2f}).")
+        elif sharpe <= 0:
+            weaknesses.append(f"Test Period Sharpe is non-positive ({sharpe:.2f}).")
     else:
-        if severe_count:
-            weaknesses.append(
-                f"{severe_count} major BRAIN robustness test(s) failed."
-            )
-        if regional_count:
-            weaknesses.append(
-                f"{regional_count} regional robustness test(s) failed."
-            )
-        if fixable_count:
-            reasons.append("Some failed BRAIN tests are structural/fixable.")
+        weaknesses.append("Test Period Sharpe unavailable.")
 
-    if warnings:
-        reasons.append(f"{len(warnings)} BRAIN warning(s) recorded.")
+    if fitness is not None:
+        score += _clamp((fitness + 0.5) / 2.5 * 4.0, 0.0, 4.0)
+        if fitness >= 2.0:
+            strengths.append(f"Strong Test Period fitness ({fitness:.2f}).")
+        elif fitness <= 0:
+            weaknesses.append(f"Test Period fitness is non-positive ({fitness:.2f}).")
+    else:
+        weaknesses.append("Test Period fitness unavailable.")
 
-    return _clamp(score, 0.0, 15.0), strengths, weaknesses, reasons
+    reasons.append("Test Period is treated as an In-Sample stability check, not true OOS.")
+    return _clamp(score, 0.0, TEST_PERIOD_MAX), strengths, weaknesses, reasons
 
 
-# ---------------------------------------------------------------------------
-# Classification
-# ---------------------------------------------------------------------------
-
-def _classify(*, result: Any, score: float) -> str:
-    """Classify a result without overriding BRAIN eligibility."""
-
-    simulation_status = str(
-        getattr(result, "simulation_status", "")
-    ).upper()
-
+def _classify(*, result: Any, score: float, is_performance: float, is_robustness: float, is_stability: float) -> str:
+    simulation_status = str(getattr(result, "simulation_status", "")).upper()
     if simulation_status != "SIMULATED":
         return FAILURE
 
     metrics = getattr(result, "metrics", None)
+    train_sharpe = _safe_float(getattr(metrics, "train_sharpe", None))
+    train_fitness = _safe_float(getattr(metrics, "train_fitness", None))
 
-    test_sharpe = _safe_float(getattr(metrics, "test_sharpe", None))
-    test_fitness = _safe_float(getattr(metrics, "test_fitness", None))
-
-    strong_oos = (
-        (test_sharpe is not None and test_sharpe >= TEST_SHARPE_STRONG)
-        or
-        (test_fitness is not None and test_fitness >= TEST_FITNESS_STRONG)
-    )
-
-    clearly_bad_oos = (
-        (test_sharpe is not None and test_sharpe <= TEST_SHARPE_FAILURE)
-        and
-        (test_fitness is not None and test_fitness <= TEST_FITNESS_FAILURE)
-    )
-
-    if clearly_bad_oos:
+    # Hard IS sanity gate: a huge Test Period result cannot rescue an alpha
+    # whose main train-period performance is non-positive.
+    if (train_sharpe is not None and train_fitness is not None
+            and train_sharpe <= 0 and train_fitness <= 0):
         return FAILURE
 
-    if strong_oos and score >= 45.0:
+    if is_performance < 12.0:
+        return FAILURE
+    if is_robustness < 14.0:
+        return WEAK
+    if is_stability < 5.0:
+        return WEAK
+    if score >= 70.0:
         return PROMISING
-
-    if score < 25.0:
+    if score < 40.0:
         return FAILURE
-
     return WEAK
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
 def score_result(result: Any) -> ResearchScore:
-    """
-    Score one results.NormalizedResult.
-
-    This function never changes eligibility_status and never treats research
-    score as a replacement for results.evaluate_alpha().
-    """
-
     metrics = getattr(result, "metrics", None)
-
     if metrics is None:
         return ResearchScore(
             alpha_id=getattr(result, "alpha_id", None),
@@ -439,185 +395,120 @@ def score_result(result: Any) -> ResearchScore:
             reasons=["Unable to score a result without metrics."],
         )
 
-    oos_score, oos_strengths, oos_weaknesses, oos_reasons = _score_oos(
-        metrics
-    )
+    is_perf, a, b, c = _score_train_performance(metrics)
+    is_rob, d, e, f = _score_is_robustness(result)
+    is_stab, g, h, i = _score_is_stability(metrics, result)
+    turnover, j, k, l = _score_turnover(metrics)
+    test_period, m, n, o = _score_test_period(metrics)
 
-    consistency_score, consistency_strengths, consistency_weaknesses, consistency_reasons = (
-        _score_consistency(metrics)
-    )
-
-    turnover_score, turnover_strengths, turnover_weaknesses, turnover_reasons = (
-        _score_turnover(metrics)
-    )
-
-    robustness_score, robustness_strengths, robustness_weaknesses, robustness_reasons = (
-        _score_robustness(result)
-    )
-
-    total_score = _clamp(
-        oos_score
-        + consistency_score
-        + turnover_score
-        + robustness_score,
-        0.0,
-        85.0,
-    )
+    total = _clamp(is_perf + is_rob + is_stab + turnover + test_period, 0.0, TOTAL_MAX)
 
     failed_gate_names = [
         _name_for_gate(gate)
         for gate in (getattr(result, "gates", []) or [])
         if _status_for_gate(gate) == "FAIL"
     ]
+    failed_brain = _brain_test_names(result, "failed_brain_tests")
+    warnings = _brain_test_names(result, "warning_brain_tests")
 
-    failed_brain_test_names = _brain_test_names(
-        result,
-        "failed_brain_tests",
-    )
+    strengths = a + d + g + j + m
+    weaknesses = b + e + h + k + n
+    reasons = c + f + i + l + o
 
-    warning_brain_test_names = _brain_test_names(
-        result,
-        "warning_brain_tests",
-    )
-
-    strengths = (
-        oos_strengths
-        + consistency_strengths
-        + turnover_strengths
-        + robustness_strengths
-    )
-
-    weaknesses = (
-        oos_weaknesses
-        + consistency_weaknesses
-        + turnover_weaknesses
-        + robustness_weaknesses
-    )
-
-    reasons = (
-        oos_reasons
-        + consistency_reasons
-        + turnover_reasons
-        + robustness_reasons
-    )
-
-    eligibility_status = str(
-        getattr(result, "eligibility_status", "")
-    ).upper()
-
-    if eligibility_status == "ELIGIBLE":
-        reasons.append("Current eligibility gates are satisfied.")
-    elif eligibility_status == "REJECTED":
-        reasons.append(
-            "Alpha is rejected for submission but remains evaluated for research value."
-        )
-    elif eligibility_status:
-        reasons.append(f"Current eligibility status: {eligibility_status}.")
+    eligibility = str(getattr(result, "eligibility_status", "")).upper()
+    if eligibility == "ELIGIBLE":
+        reasons.append("Current BRAIN eligibility gates are satisfied.")
+    elif eligibility == "REJECTED":
+        reasons.append("Alpha is rejected for submission but is retained for research diagnostics.")
 
     research_class = _classify(
         result=result,
-        score=total_score,
+        score=total,
+        is_performance=is_perf,
+        is_robustness=is_rob,
+        is_stability=is_stab,
     )
 
     return ResearchScore(
         alpha_id=getattr(result, "alpha_id", None),
-        score=round(total_score, 2),
+        score=round(total, 2),
         research_class=research_class,
-        oos_score=round(oos_score, 2),
-        consistency_score=round(consistency_score, 2),
-        turnover_score=round(turnover_score, 2),
-        robustness_score=round(robustness_score, 2),
+        oos_score=round(test_period, 2),
+        consistency_score=round(is_stab, 2),
+        turnover_score=round(turnover, 2),
+        robustness_score=round(is_rob, 2),
+        is_performance_score=round(is_perf, 2),
+        is_robustness_score=round(is_rob, 2),
+        is_stability_score=round(is_stab, 2),
+        test_period_score=round(test_period, 2),
+        true_oos_score=0.0,
         strengths=strengths,
         weaknesses=weaknesses,
         reasons=reasons,
         failed_gate_names=failed_gate_names,
-        failed_brain_test_names=failed_brain_test_names,
-        warning_brain_test_names=warning_brain_test_names,
+        failed_brain_test_names=failed_brain,
+        warning_brain_test_names=warnings,
     )
 
 
-def score_batch(
-    results: Sequence[Any] | Iterable[Any],
-) -> list[ResearchScore]:
-    """Score and rank a batch of normalized results."""
-
-    scored = [
-        score_result(result)
-        for result in results
-    ]
-
-    def sort_key(item: ResearchScore) -> tuple[float, float]:
-        return (
-            item.score,
-            item.oos_score,
-        )
-
+def score_batch(results: Sequence[Any] | Iterable[Any]) -> list[ResearchScore]:
+    scored = [score_result(result) for result in results]
     return sorted(
         scored,
-        key=sort_key,
+        key=lambda x: (x.score, x.is_performance_score, x.is_robustness_score),
         reverse=True,
     )
 
 
-def scores_to_dataframe(
-    scores: Sequence[ResearchScore] | Iterable[ResearchScore],
-):
-    """Convert ResearchScore objects to a pandas DataFrame."""
-
+def scores_to_dataframe(scores: Sequence[ResearchScore] | Iterable[ResearchScore]):
     import pandas as pd
-
     rows = []
-
     for score in scores:
-        rows.append(
-            {
-                "alpha_id": score.alpha_id,
-                "research_score": score.score,
-                "research_class": score.research_class,
-                "oos_score": score.oos_score,
-                "consistency_score": score.consistency_score,
-                "turnover_score": score.turnover_score,
-                "robustness_score": score.robustness_score,
-                "strengths": " | ".join(score.strengths),
-                "weaknesses": " | ".join(score.weaknesses),
-                "reasons": " | ".join(score.reasons),
-                "failed_gates": " | ".join(score.failed_gate_names),
-                "failed_brain_tests": " | ".join(
-                    score.failed_brain_test_names
-                ),
-                "warning_brain_tests": " | ".join(
-                    score.warning_brain_test_names
-                ),
-            }
-        )
-
+        rows.append({
+            "alpha_id": score.alpha_id,
+            "research_score": score.score,
+            "research_class": score.research_class,
+            "is_performance": score.is_performance_score,
+            "is_robustness": score.is_robustness_score,
+            "is_stability": score.is_stability_score,
+            "test_period": score.test_period_score,
+            "turnover": score.turnover_score,
+            "true_oos": score.true_oos_score,
+            "oos_score": score.oos_score,
+            "consistency_score": score.consistency_score,
+            "turnover_score": score.turnover_score,
+            "robustness_score": score.robustness_score,
+            "strengths": " | ".join(score.strengths),
+            "weaknesses": " | ".join(score.weaknesses),
+            "reasons": " | ".join(score.reasons),
+            "failed_gates": " | ".join(score.failed_gate_names),
+            "failed_brain_tests": " | ".join(score.failed_brain_test_names),
+            "warning_brain_tests": " | ".join(score.warning_brain_test_names),
+        })
     return pd.DataFrame(rows)
 
 
 def print_score(score: ResearchScore) -> None:
-    """Print one research score in a compact human-readable form."""
-
     print("=" * 80)
-    print("RESEARCH SCORE")
+    print("RESEARCH SCORE — IS FIRST")
     print("=" * 80)
-    print(f"Alpha:             {score.alpha_id}")
-    print(f"Score:             {score.score:.2f} / 85")
-    print(f"Class:             {score.research_class}")
-    print(f"OOS:               {score.oos_score:.2f} / 40")
-    print(f"Consistency:       {score.consistency_score:.2f} / 20")
-    print(f"Turnover:          {score.turnover_score:.2f} / 10")
-    print(f"Robustness:        {score.robustness_score:.2f} / 15")
-
+    print(f"Alpha:              {score.alpha_id}")
+    print(f"Score:              {score.score:.2f} / {TOTAL_MAX:.0f}")
+    print(f"Class:              {score.research_class}")
+    print(f"IS performance:     {score.is_performance_score:.2f} / {IS_PERFORMANCE_MAX:.0f}")
+    print(f"IS robustness:      {score.is_robustness_score:.2f} / {IS_ROBUSTNESS_MAX:.0f}")
+    print(f"IS stability:       {score.is_stability_score:.2f} / {IS_STABILITY_MAX:.0f}")
+    print(f"Turnover:           {score.turnover_score:.2f} / {TURNOVER_MAX:.0f}")
+    print(f"Test Period:        {score.test_period_score:.2f} / {TEST_PERIOD_MAX:.0f}")
+    print(f"True OOS:           {score.true_oos_score:.2f} / 0 (not available pre-submission)")
     if score.strengths:
         print("\nStrengths:")
         for item in score.strengths:
             print(f"  + {item}")
-
     if score.weaknesses:
         print("\nWeaknesses:")
         for item in score.weaknesses:
             print(f"  - {item}")
-
     if score.reasons:
         print("\nResearch notes:")
         for item in score.reasons:
