@@ -514,10 +514,13 @@ class CandidateGenerator:
             or ""
         ).strip()
 
-        # Non-ready hypotheses must state what they are trying to repair.
-        # The Schema 6 analyst is expected to provide this.
+        # Repair targets are deterministic candidate-generation metadata.
+        # Older analyst schemas may omit them, so infer the target from the
+        # template instead of rejecting an otherwise valid research lead.
         if not repair_target:
-            return None
+            repair_target = self._repair_target_for_template(
+                template
+            )
 
         window = self._coerce_window(
             item.get("window", 60)
